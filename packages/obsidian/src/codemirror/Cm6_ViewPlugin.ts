@@ -1,73 +1,98 @@
 import type ShikiPlugin from 'packages/obsidian/src/main';
 import { SHIKI_INLINE_REGEX } from 'packages/obsidian/src/main';
 import { Decoration, type DecorationSet, type EditorView, ViewPlugin, type ViewUpdate } from '@codemirror/view';
-import { type EditorState, type Range } from '@codemirror/state';
+import { type EditorState, type Range, StateEffect } from '@codemirror/state';
 import { type SyntaxNode } from '@lezer/common';
 import { syntaxTree } from '@codemirror/language';
 import { Cm6_Util } from 'packages/obsidian/src/codemirror/Cm6_Util';
+import { buildHighlightRegionUpdates, type HighlightRegion, LatestTaskScheduler, mapHighlightRegions } from 'packages/obsidian/src/codemirror/Cm6_UpdatePlan';
 import { type ThemedToken } from 'shiki';
 import { editorLivePreviewField } from 'obsidian';
 
-enum DecorationUpdateType {
-	Insert,
-	Remove,
+const DOCUMENT_UPDATE_DELAY_MS = 100;
+
+interface AppliedHighlightState {
+	decorations: DecorationSet;
+	regions: HighlightRegion[];
+	forced: boolean;
 }
 
-type DecorationUpdate = InsertDecoration | RemoveDecoration;
-
-interface InsertDecoration {
-	type: DecorationUpdateType.Insert;
-	from: number;
-	to: number;
-	lang: string;
-	content: string;
-	hideLang?: boolean;
-	hideTo?: number;
+interface PreparedHighlightState extends AppliedHighlightState {
+	hasChanges: boolean;
 }
 
-interface RemoveDecoration {
-	type: DecorationUpdateType.Remove;
-	from: number;
-	to: number;
-}
+const applyHighlightState = StateEffect.define<AppliedHighlightState>();
 
 // eslint-disable-next-line @typescript-eslint/explicit-function-return-type -- not an easily named type
 export function createCm6Plugin(plugin: ShikiPlugin) {
 	return ViewPlugin.fromClass(
 		class Cm6ViewPlugin {
 			decorations: DecorationSet;
+			regions: HighlightRegion[];
 			view: EditorView;
+
+			private readonly scheduler: LatestTaskScheduler<PreparedHighlightState>;
+			private forceNextUpdate = false;
+			private destroyed = false;
 
 			constructor(view: EditorView) {
 				this.view = view;
 				this.decorations = Decoration.none;
-				void this.updateWidgets(view);
+				this.regions = [];
+				this.scheduler = new LatestTaskScheduler(
+					() => this.prepareHighlightState(),
+					prepared => this.applyPreparedHighlightState(prepared),
+				);
+
+				this.scheduleUpdate(0);
 
 				plugin.updateCm6Plugin = (): Promise<void> => {
-					return this.updateWidgets(this.view);
+					this.forceNextUpdate = true;
+					return this.scheduler.request(0);
 				};
 			}
 
 			/**
-			 * Triggered by codemirror when the view updates.
-			 * Depending on the update type, the decorations are either updated or recreated.
+			 * Maps existing decorations synchronously and schedules only the asynchronous
+			 * work that may have changed.
 			 *
 			 * @param update
 			 */
 			update(update: ViewUpdate): void {
-				try {
-					this.decorations = this.decorations.map(update.changes);
-				} catch (e) {
-					// Decorations may have stale positions if the document changed while an async
-					// updateWidgets call was in flight. Reset them so the next update can rebuild.
-					this.decorations = Decoration.none;
-					console.warn('Resetting decorations due to error:', e);
+				this.view = update.view;
+
+				if (update.docChanged) {
+					try {
+						this.decorations = this.decorations.map(update.changes);
+						this.regions = mapHighlightRegions(this.regions, update.changes);
+					} catch (error) {
+						this.decorations = Decoration.none;
+						this.regions = [];
+						console.warn('Resetting decorations due to error:', error);
+					}
 				}
 
-				// we handle doc changes and selection changes here
-				if (update.docChanged || update.selectionSet) {
-					this.view = update.view;
-					void this.updateWidgets(update.view, update.docChanged);
+				let appliedScheduledState = false;
+				for (const transaction of update.transactions) {
+					for (const effect of transaction.effects) {
+						if (effect.is(applyHighlightState)) {
+							this.decorations = effect.value.decorations;
+							this.regions = effect.value.regions;
+							if (effect.value.forced) {
+								this.forceNextUpdate = false;
+							}
+							appliedScheduledState = true;
+						}
+					}
+				}
+
+				if (appliedScheduledState) {
+					return;
+				}
+				if (update.docChanged) {
+					this.scheduleUpdate(DOCUMENT_UPDATE_DELAY_MS);
+				} else if (update.selectionSet) {
+					this.scheduleUpdate(0);
 				}
 			}
 
@@ -76,207 +101,197 @@ export function createCm6Plugin(plugin: ShikiPlugin) {
 				return state.field(editorLivePreviewField);
 			}
 
-			/**
-			 * Updates all the widgets by traversing the syntax tree.
-			 *
-			 * @param view
-			 * @param docChanged
-			 */
-			async updateWidgets(view: EditorView, docChanged: boolean = true): Promise<void> {
-				let lang = '';
-				let state: SyntaxNode[] = [];
-				const decorationUpdates: DecorationUpdate[] = [];
-				// Capture the state at the time of the syntax tree traversal so we can
-				// detect if the document changed while async decoration building was in flight.
-				const capturedState = view.state;
+			private scheduleUpdate(delayMs: number): void {
+				void this.scheduler.request(delayMs).catch(error => {
+					if (!this.destroyed) {
+						console.error('Failed to update Shiki editor decorations:', error);
+					}
+				});
+			}
 
-				// const t1 = performance.now();
+			private async prepareHighlightState(): Promise<PreparedHighlightState> {
+				const state = this.view.state;
+				const currentRegions = this.collectHighlightRegions(state);
+				const forced = this.forceNextUpdate;
+				const update = await buildHighlightRegionUpdates(
+					this.regions,
+					currentRegions,
+					async region => {
+						try {
+							return await this.buildDecorations(region);
+						} catch (error) {
+							console.error(error);
+							return [];
+						}
+					},
+					forced,
+				);
 
-				syntaxTree(view.state).iterate({
+				return {
+					decorations: this.applyDecorationChanges(update.remove, update.add),
+					regions: update.regions,
+					forced,
+					hasChanges: update.hasChanges,
+				};
+			}
+
+			private applyPreparedHighlightState(prepared: PreparedHighlightState): void {
+				if (!prepared.hasChanges) {
+					return;
+				}
+
+				this.view.dispatch({
+					effects: applyHighlightState.of({
+						decorations: prepared.decorations,
+						regions: prepared.regions,
+						forced: prepared.forced,
+					}),
+				});
+			}
+
+			private collectHighlightRegions(state: EditorState): HighlightRegion[] {
+				let language = '';
+				let codeBlockLines: SyntaxNode[] = [];
+				const regions: HighlightRegion[] = [];
+
+				syntaxTree(state).iterate({
 					enter: nodeRef => {
 						const node = nodeRef.node;
-
-						const props: Set<string> = new Set<string>(node.type.name?.split('_'));
+						const props = new Set(node.type.name?.split('_'));
 
 						if (props.has('formatting')) {
 							return;
 						}
 
 						if (props.has('inline-code')) {
-							const content = Cm6_Util.getContent(view.state, node.from, node.to);
-
-							if (content.startsWith('{') && plugin.settings.inlineHighlighting) {
-								const match = content.match(SHIKI_INLINE_REGEX); // format: `{lang} code`
-								if (match) {
-									const hasSelectionOverlap = Cm6_Util.checkSelectionAndRangeOverlap(view.state.selection, node.from - 1, node.to + 1);
-
-									decorationUpdates.push({
-										type: DecorationUpdateType.Insert,
-										from: node.from,
-										to: node.to,
-										lang: match[1],
-										content: match[2],
-										hideLang: this.isLivePreview(view.state) && !hasSelectionOverlap,
-										hideTo: node.from + match[1].length + 3, // hide `{lang} `
-									});
-								}
-							} else {
-								// we don't want to highlight normal inline code blocks, thus we remove any of our decorations
-								// we could check if we even have any decorations at this node, but it's not necessary
-								this.removeDecoration(node.from, node.to);
+							const content = Cm6_Util.getContent(state, node.from, node.to);
+							if (!content.startsWith('{') || !plugin.settings.inlineHighlighting) {
+								return;
 							}
-							return;
-						}
 
-						// if !docChanged, then this change was a selection change.
-						// We only care about inline code blocks in this case, so we can skip the rest.
-						if (!docChanged) {
+							const match = content.match(SHIKI_INLINE_REGEX);
+							if (!match) {
+								return;
+							}
+
+							const hideTo = node.from + match[1].length + 3;
+							const hasSelectionOverlap = Cm6_Util.checkSelectionAndRangeOverlap(state.selection, node.from - 1, node.to + 1);
+							regions.push({
+								kind: 'inline',
+								from: node.from,
+								to: node.to,
+								highlightFrom: hideTo,
+								language: match[1],
+								content: match[2],
+								hideLanguage: this.isLivePreview(state) && !hasSelectionOverlap,
+								hideTo,
+							});
 							return;
 						}
 
 						if (props.has('HyperMD-codeblock') && !props.has('HyperMD-codeblock-begin') && !props.has('HyperMD-codeblock-end')) {
-							state.push(node);
+							codeBlockLines.push(node);
 							return;
 						}
 
 						if (props.has('HyperMD-codeblock-begin')) {
-							const content = Cm6_Util.getContent(view.state, node.from, node.to);
-
-							lang = /```\s*(\S+)/.exec(content)?.[1] ?? '';
+							const content = Cm6_Util.getContent(state, node.from, node.to);
+							language = /```\s*(\S+)/.exec(content)?.[1] ?? '';
 						}
 
 						if (props.has('HyperMD-codeblock-end')) {
-							if (state.length > 0 && lang !== '') {
-								const start = state[0].from;
-								const end = state[state.length - 1].to;
-
-								decorationUpdates.push({
-									type: DecorationUpdateType.Insert,
-									from: start,
-									to: end,
-									lang,
-									content: Cm6_Util.getContent(view.state, start, end),
+							if (codeBlockLines.length > 0 && language !== '') {
+								const from = codeBlockLines[0].from;
+								const to = codeBlockLines[codeBlockLines.length - 1].to;
+								regions.push({
+									kind: 'block',
+									from,
+									to,
+									highlightFrom: from,
+									language,
+									content: Cm6_Util.getContent(state, from, to),
 								});
 							}
 
-							if (state.length > 0 && lang === '') {
-								const start = state[0].from;
-								const end = state[state.length - 1].to;
-
-								decorationUpdates.push({
-									type: DecorationUpdateType.Remove,
-									from: start,
-									to: end,
-								});
-							}
-
-							lang = '';
-							state = [];
+							language = '';
+							codeBlockLines = [];
 						}
 					},
 				});
 
-				for (const node of decorationUpdates) {
-					try {
-						if (node.type === DecorationUpdateType.Remove) {
-							this.removeDecoration(node.from, node.to);
-						} else if (node.type === DecorationUpdateType.Insert) {
-							const decorations = await this.buildDecorations(node.hideTo ?? node.from, node.to, node.lang, node.content);
-							// If the document changed while we were awaiting, the positions we captured
-							// from the syntax tree are stale. Abort to avoid applying out-of-range decorations.
-							if (this.view.state !== capturedState) {
-								return;
-							}
-							this.removeDecoration(node.from, node.to);
-							if (node.hideLang) {
-								// add the decoration that hides the language tag
-								decorations.unshift(Decoration.replace({}).range(node.from, node.hideTo));
-							}
-							// add the highlight decorations
-							this.addDecoration(node.from, node.to, decorations);
-						}
-					} catch (e) {
-						console.error(e);
+				return regions;
+			}
+
+			private applyDecorationChanges(remove: readonly { from: number; to: number }[], add: readonly Range<Decoration>[]): DecorationSet {
+				if (remove.length === 0) {
+					return add.length === 0 ? this.decorations : this.decorations.update({ add, sort: true });
+				}
+
+				const removalRanges = this.mergeRanges(remove);
+				return this.decorations.update({
+					filterFrom: removalRanges[0].from,
+					filterTo: removalRanges[removalRanges.length - 1].to,
+					filter: (from, to) => !this.overlapsAnyRange(from, to, removalRanges),
+					add,
+					sort: true,
+				});
+			}
+
+			private mergeRanges(ranges: readonly { from: number; to: number }[]): { from: number; to: number }[] {
+				const sorted = [...ranges].sort((left, right) => left.from - right.from || left.to - right.to);
+				const merged: { from: number; to: number }[] = [];
+
+				for (const range of sorted) {
+					const last = merged.at(-1);
+					if (last && range.from <= last.to) {
+						last.to = Math.max(last.to, range.to);
+					} else {
+						merged.push({ ...range });
 					}
 				}
 
-				if (decorationUpdates.length > 0 && this.view.state === capturedState) {
-					// Use requestAnimationFrame to avoid "Calls to EditorView.update are not allowed while an update is in progress"
-					requestAnimationFrame(() => {
-						if (this.view.state === capturedState) {
-							this.view.dispatch(this.view.state.update({}));
-						}
-					});
-				}
-
-				// console.log('Traversed syntax tree in', performance.now() - t1, 'ms');
+				return merged;
 			}
 
-			/**
-			 * Removes all decorations at a given node.
-			 *
-			 * @param from
-			 * @param to
-			 */
-			removeDecoration(from: number, to: number): void {
-				this.decorations = this.decorations.update({
-					filterFrom: from,
-					filterTo: to,
-					filter: (_from3, _to3, _decoration) => {
-						return false;
-					},
-				});
-			}
+			private overlapsAnyRange(from: number, to: number, ranges: readonly { from: number; to: number }[]): boolean {
+				let low = 0;
+				let high = ranges.length - 1;
 
-			/**
-			 * Adds a widget at a given node if it does not exist yet.
-			 *
-			 * @param from
-			 * @param to
-			 * @param newDecorations
-			 */
-			addDecoration(from: number, to: number, newDecorations: Range<Decoration>[]): void {
-				// check if the decoration already exists and only add it if it does not exist
-				if (Cm6_Util.existsDecorationBetween(this.decorations, from, to)) {
-					return;
+				while (low <= high) {
+					const middle = Math.floor((low + high) / 2);
+					const range = ranges[middle];
+					if (range.to < from) {
+						low = middle + 1;
+					} else if (range.from > to) {
+						high = middle - 1;
+					} else {
+						return true;
+					}
 				}
 
-				if (newDecorations.length === 0) {
-					return;
-				}
-
-				this.decorations = this.decorations.update({
-					add: newDecorations,
-				});
+				return false;
 			}
 
-			/**
-			 * Builds mark decorations for a given range, laguage and content.
-			 *
-			 * @param from
-			 * @param to
-			 * @param language
-			 * @param content
-			 */
-			async buildDecorations(from: number, to: number, language: string, content: string): Promise<Range<Decoration>[]> {
-				if (language === '') {
+			private async buildDecorations(region: HighlightRegion): Promise<Range<Decoration>[]> {
+				if (region.language === '') {
 					return [];
 				}
 
-				const highlight = await plugin.highlighter.getHighlightTokens(content, language.toLowerCase());
-
+				const highlight = await plugin.highlighter.getHighlightTokens(region.content, region.language.toLowerCase());
 				if (!highlight) {
 					return [];
 				}
 
 				const tokens = highlight.tokens.flat(1);
-
 				const decorations: Range<Decoration>[] = [];
+
+				if (region.hideLanguage && region.hideTo !== undefined) {
+					decorations.push(Decoration.replace({}).range(region.from, region.hideTo));
+				}
 
 				for (let i = 0; i < tokens.length; i++) {
 					const token = tokens[i];
 					const nextToken: ThemedToken | undefined = tokens[i + 1];
-
 					const tokenStyle = plugin.highlighter.getTokenStyle(token);
 
 					decorations.push(
@@ -285,7 +300,7 @@ export function createCm6Plugin(plugin: ShikiPlugin) {
 								style: tokenStyle.style,
 								class: tokenStyle.classes.join(' '),
 							},
-						}).range(from + token.offset, nextToken ? from + nextToken.offset : to),
+						}).range(region.highlightFrom + token.offset, nextToken ? region.highlightFrom + nextToken.offset : region.to),
 					);
 				}
 
@@ -293,14 +308,17 @@ export function createCm6Plugin(plugin: ShikiPlugin) {
 			}
 
 			/**
-			 * Triggered by codemirror when the view plugin is destroyed.
+			 * Triggered when the CodeMirror view plugin is destroyed.
 			 */
 			destroy(): void {
+				this.destroyed = true;
+				this.scheduler.destroy();
 				this.decorations = Decoration.none;
+				this.regions = [];
 			}
 		},
 		{
-			decorations: v => v.decorations,
+			decorations: value => value.decorations,
 		},
 	);
 }
